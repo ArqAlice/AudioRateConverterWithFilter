@@ -1,9 +1,7 @@
 import sys
 import soundfile as sf
 import numpy as np
-import sox
-import subprocess
-from scipy.signal import iirdesign, sosfiltfilt
+from scipy.signal import iirdesign, sosfiltfilt, butter, lfilter
 from scipy.signal import resample_poly
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QLabel, QFileDialog,
@@ -11,21 +9,101 @@ from PySide6.QtWidgets import (
 )
 from mutagen.flac import FLAC
 from mutagen.dsf import DSF
-from mutagen.dsdiff import DSDIFF
 import os
+import struct
 
 SIZE_CHUNK = 10
 
+def dsd_to_pcm_stream(input_file, output_file, pcm_sample_rate, buffer_size=1024*1024):
+    """
+    Stream-based conversion of a DSF file to PCM.
+
+    Parameters:
+        input_file (str): Path to the input DSF file.
+        output_file (str): Path to the output WAV file.
+        pcm_sample_rate (int): Desired PCM sample rate.
+        buffer_size (int): Size of the DSD data buffer to process in bytes.
+    """
+    def read_dsf_header(file):
+        # Read the DSF header and return metadata
+        header = file.read(28)
+        if header[:4] != b"DSD ":
+            raise ValueError("Invalid DSF file")
+        file_size = struct.unpack("<Q", header[12:20])[0]
+        fmt_chunk_size = struct.unpack("<Q", file.read(8))[0]
+        file.seek(12, 1)  # Skip reserved bytes
+        channel_count = struct.unpack("<I", file.read(4))[0]
+        sample_rate = struct.unpack("<I", file.read(4))[0]
+        bit_depth = struct.unpack("<I", file.read(4))[0]
+        file.seek(fmt_chunk_size - 20, 1)  # Skip the rest of the format chunk
+        return {
+            "channel_count": channel_count,
+            "sample_rate": sample_rate,
+            "bit_depth": bit_depth,
+            "file_size": file_size,
+        }
+
+    def lowpass_filter(data, dsd_sample_rate, pcm_sample_rate):
+        # Apply a low-pass filter to the data
+        nyquist_rate = dsd_sample_rate / 2
+        cutoff_freq = pcm_sample_rate / 2
+        b, a = butter(5, cutoff_freq / nyquist_rate, btype='low')
+        return lfilter(b, a, data)
+
+    def dsd_chunk_to_pcm(dsd_chunk, dsd_sample_rate, pcm_sample_rate, channel_count):
+        # Convert a chunk of DSD data to PCM
+        pcm_data = []
+        for ch in range(channel_count):
+            # Extract interleaved channel data
+            dsd_channel = dsd_chunk[ch::channel_count]
+            # Convert 1-bit DSD to signed (-1, 1)
+            dsd_signed = 2 * dsd_channel - 1
+            # Apply low-pass filter
+            filtered_data = lowpass_filter(dsd_signed, dsd_sample_rate, pcm_sample_rate)
+            # Decimate (downsample)
+            decimation_factor = dsd_sample_rate // pcm_sample_rate
+            pcm_channel = filtered_data[::decimation_factor]
+            pcm_data.append(pcm_channel)
+        return np.array(pcm_data)
+
+    # Open the DSF file
+    with open(input_file, "rb") as dsf:
+        # Parse the DSF header
+        metadata = read_dsf_header(dsf)
+        channel_count = metadata["channel_count"]
+        dsd_sample_rate = metadata["sample_rate"]
+
+        # Open the output WAV file
+        with open(output_file, "wb") as wav:
+            # Write a simple WAV header (placeholder)
+            wav.write(b"RIFF")
+            wav.write(b"\0" * 36)  # Placeholder for WAV size and format
+            
+            # Process DSD data in chunks
+            while True:
+                # Read a chunk of interleaved DSD data
+                chunk = dsf.read(buffer_size)
+                if not chunk:
+                    break
+
+                # Convert DSD chunk to PCM
+                dsd_data = np.frombuffer(chunk, dtype=np.uint8)
+                pcm_data = dsd_chunk_to_pcm(dsd_data, dsd_sample_rate, pcm_sample_rate, channel_count)
+                
+                # Write PCM data to WAV
+                pcm_data = (pcm_data.T * 32767).astype(np.int16)  # Convert to 16-bit PCM
+                wav.write(pcm_data.tobytes())
+            
+            return 1
+
 class AudioProcessor:
-    def __init__(self, filepath, chunk_size=44100):
+    def __init__(self, filepath, chunk_size=44100*SIZE_CHUNK):
         self.filepath = filepath
         self.samplerate = None
         self.chunk_size = chunk_size
         
         if self.filepath.endswith(".dsf"):
             self.metadata = DSF(filepath)
-        elif self.filepath.endswith(".dff"):
-            self.metadata = DSDIFF(filepath)
         else:
             self.metadata = FLAC(filepath)
 
@@ -77,13 +155,29 @@ class AudioProcessor:
                         # 処理済みデータを書き込む
                         outfile.write(filtered_data)
                         
-        # ファイルタイプがFLACでないとき(DSF, DFFのとき)
+        # ファイルタイプがFLACでないとき(DSFのとき)
         else:
             pcm_temp_path = output_path.replace(".flac", "_temp.wav")
-            if not self.convert_dsd_to_pcm(self.filepath, pcm_temp_path, target_samplerate=target_samplerate):
+            if not dsd_to_pcm_stream(self.filepath, pcm_temp_path, target_samplerate, buffer_size = 8192*8192):
                 QMessageBox.critical(self, "Error", "Failed to convert DSD to PCM.")
                 return
             
+            with sf.SoundFile(pcm_temp_path, mode='r') as tempfile:
+                
+                with sf.SoundFile(output_path, mode='w',
+                                    samplerate=target_samplerate,
+                                    channels=tempfile.channels,
+                                    subtype='PCM_24' if target_bitdepth == 24 else 'PCM_16',
+                                    format='FLAC') as outfile:
+                    while True:
+                        # チャンク単位でデータを読み取る
+                        data = tempfile.read(self.chunk_size)
+                        if not len(data):
+                            break
+                        
+                        # 処理済みデータを書き込む
+                        outfile.write(data)
+
         # メタデータの保存
         self._save_metadata(output_path)
 
@@ -100,36 +194,10 @@ class AudioProcessor:
             resampled = [resample_poly(data[:, ch], up, down) for ch in range(data.shape[1])]
             return np.column_stack(resampled)
 
-    def convert_dsd_to_pcm(input_dsd_path, output_pcm_path, target_samplerate=44100):
-        """
-        DSDファイルをPCM形式に変換します。
-        
-        Args:
-            input_dsd_path (str): 入力DSDファイルのパス。
-            output_pcm_path (str): 出力PCMファイルのパス。
-            target_samplerate (int): 出力PCMのサンプルレート（Hz）。
-        
-        Returns:
-            bool: 成功時にTrueを返します。
-        """
-        try:
-            # soxコマンドを呼び出して変換
-            command = [
-                "sox", input_dsd_path, "-r", str(target_samplerate),
-                "-b", "24", "-e", "signed-integer", output_pcm_path
-            ]
-            subprocess.run(command, check=True)
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"Error during DSD to PCM conversion: {e}")
-            return False
-
     def _save_metadata(self, output_path):
         
         if self.filepath.endswith(".dsf"):
             new_metadata = DSF(output_path)
-        elif self.filepath.endswith(".dff"):
-            new_metadata = DSDIFF(output_path)
         else:
             new_metadata = FLAC(output_path)
 
@@ -208,7 +276,7 @@ class MainWindow(QWidget):
         self.setLayout(self.layout_0)
 
     def select_files(self):
-        file_paths, _ = QFileDialog.getOpenFileNames(self, "Select Audio Files", "", "Audio Files (*.flac *.dsf *.dff)")
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "Select Audio Files", "", "Audio Files (*.flac *.dsf)")
         if file_paths:
             for file_path in file_paths:
                 self.file_list_widget.addItem(file_path)
