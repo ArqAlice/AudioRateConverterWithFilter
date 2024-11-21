@@ -5,11 +5,12 @@ from scipy.signal import iirdesign, sosfiltfilt
 from scipy.signal import resample_poly
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QLabel, QFileDialog,
-    QLineEdit, QListWidget, QComboBox,  QMessageBox
+    QLineEdit, QListWidget, QComboBox,  QMessageBox, QHBoxLayout
 )
 from mutagen.flac import FLAC
 import os
 
+SIZE_CHUNK = 100
 
 class AudioProcessor:
     def __init__(self, filepath, chunk_size=44100):
@@ -92,63 +93,67 @@ class MainWindow(QWidget):
 
     def init_ui(self):
         self.setWindowTitle("AudioRateConverter with Filter")
-        self.layout = QVBoxLayout()
+        self.layout_0 = QVBoxLayout()
 
         self.file_list_label = QLabel("Selected Files:")
-        self.layout.addWidget(self.file_list_label)
+        self.layout_0.addWidget(self.file_list_label)
 
         self.file_list_widget = QListWidget()
-        self.layout.addWidget(self.file_list_widget)
+        self.layout_0.addWidget(self.file_list_widget)
 
         self.select_files_button = QPushButton("Add FLAC Files")
         self.select_files_button.clicked.connect(self.select_files)
-        self.layout.addWidget(self.select_files_button)
+        self.layout_0.addWidget(self.select_files_button)
+        
+        self.clear_list_button = QPushButton("Clear File List")
+        self.clear_list_button.clicked.connect(self.clear_list)
+        self.layout_0.addWidget(self.clear_list_button)
         
         self.output_directory_label = QLabel("Output Directory")
-        self.layout.addWidget(self.output_directory_label)
+        self.layout_0.addWidget(self.output_directory_label)
         
         self.output_directory = QLineEdit()
-        self.layout.addWidget(self.output_directory)
+        self.layout_0.addWidget(self.output_directory)
         
         self.select_directory_button = QPushButton("Get Output Directory")
         self.select_directory_button.clicked.connect(self.select_folder)
-        self.layout.addWidget(self.select_directory_button)
+        self.layout_0.addWidget(self.select_directory_button)
 
         self.filter_cutoff_label = QLabel("Filter Cutoff Frequency (Hz):")
-        self.layout.addWidget(self.filter_cutoff_label)
+        self.layout_0.addWidget(self.filter_cutoff_label)
 
         self.filter_cutoff_input = QLineEdit("22000")
-        self.layout.addWidget(self.filter_cutoff_input)
+        self.layout_0.addWidget(self.filter_cutoff_input)
 
         self.filter_stopband_label = QLabel("Filter stop band attenuation (dB):")
-        self.layout.addWidget(self.filter_stopband_label)
+        self.layout_0.addWidget(self.filter_stopband_label)
         
         self.filter_stopband_atten = QLineEdit("150")
-        self.layout.addWidget(self.filter_stopband_atten)
+        self.layout_0.addWidget(self.filter_stopband_atten)
 
         self.resample_rate_label = QLabel("Resample Rate (Hz):")
-        self.layout.addWidget(self.resample_rate_label)
+        self.layout_0.addWidget(self.resample_rate_label)
 
         self.resample_rate_input = QComboBox()
         self.resample_rate_input.addItems(["44100", "48000", "88200", "96000", 
                                             "176400", "192000", "352800", "384000"])
-        self.layout.addWidget(self.resample_rate_input)
+        self.layout_0.addWidget(self.resample_rate_input)
         
         self.bitdepth_label = QLabel("Target Bit Depth:")
-        self.layout.addWidget(self.bitdepth_label)
+        self.layout_0.addWidget(self.bitdepth_label)
         
         self.bitdepth_input = QComboBox()
         self.bitdepth_input.addItems(["16", "24"])
-        self.layout.addWidget(self.bitdepth_input)
+        self.layout_0.addWidget(self.bitdepth_input)
 
         self.process_button = QPushButton("Process All Files")
         self.process_button.clicked.connect(self.process_files)
-        self.layout.addWidget(self.process_button)
+        self.layout_0.addWidget(self.process_button)
 
         self.status_label = QLabel("Status: Waiting for input")
-        self.layout.addWidget(self.status_label)
+        self.layout_0.addWidget(self.status_label)
 
-        self.setLayout(self.layout)
+        self.setLayout(self.layout_0)
 
     def select_files(self):
         file_paths, _ = QFileDialog.getOpenFileNames(self, "Select FLAC Files", "", "FLAC Files (*.flac)")
@@ -160,6 +165,9 @@ class MainWindow(QWidget):
         folderpath = QFileDialog.getExistingDirectory(self)
         if folderpath:
             self.output_directory.setText(folderpath)
+    
+    def clear_list(self):
+        self.file_list_widget.clear()
 
     def process_files(self):
         try:
@@ -179,7 +187,7 @@ class MainWindow(QWidget):
                 
                 bitdepth = int(self.bitdepth_input.currentText())
                 stopband_atten = float(self.filter_stopband_atten.text())
-                processor = AudioProcessor(file_path)
+                processor = AudioProcessor(file_path, resample_rate * SIZE_CHUNK)
                 processor.process_in_chunks(output_path, cutoff, stopband_atten=stopband_atten, target_samplerate=resample_rate, target_bitdepth=bitdepth)
 
                 self.status_label.setText(f"Processed: {file_path}")
