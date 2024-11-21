@@ -1,6 +1,8 @@
 import sys
 import soundfile as sf
 import numpy as np
+import sox
+import subprocess
 from scipy.signal import iirdesign, sosfiltfilt
 from scipy.signal import resample_poly
 from PySide6.QtWidgets import (
@@ -8,61 +10,80 @@ from PySide6.QtWidgets import (
     QLineEdit, QListWidget, QComboBox,  QMessageBox, QHBoxLayout
 )
 from mutagen.flac import FLAC
+from mutagen.dsf import DSF
+from mutagen.dsdiff import DSDIFF
 import os
 
-SIZE_CHUNK = 100
+SIZE_CHUNK = 10
 
 class AudioProcessor:
     def __init__(self, filepath, chunk_size=44100):
         self.filepath = filepath
         self.samplerate = None
-        self.metadata = FLAC(filepath)
-        self.chunk_size = chunk_size  # 1秒分（例: 44100サンプル）
+        self.chunk_size = chunk_size
+        
+        if self.filepath.endswith(".dsf"):
+            self.metadata = DSF(filepath)
+        elif self.filepath.endswith(".dff"):
+            self.metadata = DSDIFF(filepath)
+        else:
+            self.metadata = FLAC(filepath)
 
     def process_in_chunks(self, output_path, cutoff, stopband_atten, filter_type='lowpass', 
                             target_samplerate=None, target_bitdepth=None):
 
-        with sf.SoundFile(self.filepath, mode='r') as infile:
-            self.samplerate = infile.samplerate
+        # ファイルタイプがFLACのとき
+        if self.filepath.endswith(".flac"):
             
-            if infile.subtype == 'PCM_24':
-                self.bitdepth = 24
-            elif infile.subtype == 'PCM_16':
-                self.bitdepth = 16
+            with sf.SoundFile(self.filepath, mode='r') as infile:
+                self.samplerate = infile.samplerate
+                
+                if infile.subtype == 'PCM_24':
+                    self.bitdepth = 24
+                elif infile.subtype == 'PCM_16':
+                    self.bitdepth = 16
 
-            wp1 = cutoff                # 通過域遮断周波数[Hz]
-            ws1 = cutoff * 1.05         # 阻止域遮断周波数[Hz]
-            gpass1 = 0.5                # 通過域最大損失量[dB]
-            gstop1 = stopband_atten     # 阻止域最小減衰量[dB]
+                wp1 = cutoff                # 通過域遮断周波数[Hz]
+                ws1 = cutoff * 1.05         # 阻止域遮断周波数[Hz]
+                gpass1 = 0.5                # 通過域最大損失量[dB]
+                gstop1 = stopband_atten     # 阻止域最小減衰量[dB]
+                
+                sos = iirdesign(wp1, ws1, gpass1, gstop1, output='sos', ftype='cheby2', fs=target_samplerate)
+
+                # 出力のサンプルレートを設定
+                output_samplerate = target_samplerate if target_samplerate else self.samplerate
+
+                with sf.SoundFile(output_path, mode='w',
+                                samplerate=output_samplerate,
+                                channels=infile.channels,
+                                subtype='PCM_24' if target_bitdepth == 24 else 'PCM_16',
+                                format='FLAC') as outfile:
+                    while True:
+                        # チャンク単位でデータを読み取る
+                        data = infile.read(self.chunk_size)
+                        if not len(data):
+                            break
+                        
+                        # フィルタするデータの箱を宣言
+                        filtered_data = data
+
+                        # リサンプリング（必要な場合のみ）
+                        if target_samplerate and target_samplerate != self.samplerate:
+                            filtered_data = self.resample(filtered_data, self.samplerate, target_samplerate)
+                        
+                        # フィルタリング
+                        filtered_data = sosfiltfilt(sos, filtered_data, axis=0)
+                        
+                        # 処理済みデータを書き込む
+                        outfile.write(filtered_data)
+                        
+        # ファイルタイプがFLACでないとき(DSF, DFFのとき)
+        else:
+            pcm_temp_path = output_path.replace(".flac", "_temp.wav")
+            if not self.convert_dsd_to_pcm(self.filepath, pcm_temp_path, target_samplerate=target_samplerate):
+                QMessageBox.critical(self, "Error", "Failed to convert DSD to PCM.")
+                return
             
-            sos = iirdesign(wp1, ws1, gpass1, gstop1, output='sos', ftype='cheby2', fs=target_samplerate)
-
-            # 出力のサンプルレートを設定
-            output_samplerate = target_samplerate if target_samplerate else self.samplerate
-
-            with sf.SoundFile(output_path, mode='w',
-                            samplerate=output_samplerate,
-                            channels=infile.channels,
-                            subtype='PCM_24' if target_bitdepth == 24 else 'PCM_16',
-                            format='FLAC') as outfile:
-                while True:
-                    # チャンク単位でデータを読み取る
-                    data = infile.read(self.chunk_size)
-                    if not len(data):
-                        break
-                    
-                    # フィルタするデータの箱を宣言
-                    filtered_data = data
-
-                    # リサンプリング（必要な場合のみ）
-                    if target_samplerate and target_samplerate != self.samplerate:
-                        filtered_data = self.resample(filtered_data, self.samplerate, target_samplerate)
-                    
-                    # フィルタリング
-                    filtered_data = sosfiltfilt(sos, filtered_data, axis=0)
-                    
-                    # 処理済みデータを書き込む
-                    outfile.write(filtered_data)
         # メタデータの保存
         self._save_metadata(output_path)
 
@@ -79,8 +100,39 @@ class AudioProcessor:
             resampled = [resample_poly(data[:, ch], up, down) for ch in range(data.shape[1])]
             return np.column_stack(resampled)
 
+    def convert_dsd_to_pcm(input_dsd_path, output_pcm_path, target_samplerate=44100):
+        """
+        DSDファイルをPCM形式に変換します。
+        
+        Args:
+            input_dsd_path (str): 入力DSDファイルのパス。
+            output_pcm_path (str): 出力PCMファイルのパス。
+            target_samplerate (int): 出力PCMのサンプルレート（Hz）。
+        
+        Returns:
+            bool: 成功時にTrueを返します。
+        """
+        try:
+            # soxコマンドを呼び出して変換
+            command = [
+                "sox", input_dsd_path, "-r", str(target_samplerate),
+                "-b", "24", "-e", "signed-integer", output_pcm_path
+            ]
+            subprocess.run(command, check=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"Error during DSD to PCM conversion: {e}")
+            return False
+
     def _save_metadata(self, output_path):
-        new_metadata = FLAC(output_path)
+        
+        if self.filepath.endswith(".dsf"):
+            new_metadata = DSF(output_path)
+        elif self.filepath.endswith(".dff"):
+            new_metadata = DSDIFF(output_path)
+        else:
+            new_metadata = FLAC(output_path)
+
         for key, value in self.metadata.tags.items():
             new_metadata[key] = value
         new_metadata.save()
@@ -101,7 +153,7 @@ class MainWindow(QWidget):
         self.file_list_widget = QListWidget()
         self.layout_0.addWidget(self.file_list_widget)
 
-        self.select_files_button = QPushButton("Add FLAC Files")
+        self.select_files_button = QPushButton("Add FLAC/DSD Files")
         self.select_files_button.clicked.connect(self.select_files)
         self.layout_0.addWidget(self.select_files_button)
         
@@ -156,7 +208,7 @@ class MainWindow(QWidget):
         self.setLayout(self.layout_0)
 
     def select_files(self):
-        file_paths, _ = QFileDialog.getOpenFileNames(self, "Select FLAC Files", "", "FLAC Files (*.flac)")
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "Select Audio Files", "", "Audio Files (*.flac *.dsf *.dff)")
         if file_paths:
             for file_path in file_paths:
                 self.file_list_widget.addItem(file_path)
@@ -176,11 +228,11 @@ class MainWindow(QWidget):
 
             for i in range(self.file_list_widget.count()):
                 file_path = self.file_list_widget.item(i).text()
-                file_name = os.path.basename(file_path)
+                file_name = os.path.splitext(os.path.basename(file_path))[0]
                 output_directory = self.output_directory.text()
                 
                 if output_directory:
-                    output_path = output_directory + "/" +file_name
+                    output_path = output_directory + "/" +file_name + ".flac"
                 else:
                     QMessageBox.warning(self, "Error", "Please specify output directory.")
                     return
