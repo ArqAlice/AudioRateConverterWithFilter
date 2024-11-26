@@ -64,15 +64,22 @@ class DSDProcessor:
 
 
     def _dsd_chunk_to_pcm(self, dsd_chunk, pcm_sample_rate):
+        
+        # Unpack 8-bit packed DSD data to 1-bit
+        dsd_unpacked = np.unpackbits(dsd_chunk).reshape(-1, self.channel_count * 8)
+        
         # Convert a chunk of DSD data to PCM
         pcm_data = []
         for ch in range(self.channel_count):
             # Extract interleaved channel data
-            dsd_channel = dsd_chunk[ch::self.channel_count]
+            dsd_channel = dsd_unpacked[:, ch::self.channel_count]
+            dsd_channel = dsd_channel.flatten()  # Flatten interleaved bits into a single array
+            
             # Convert 1-bit DSD to signed (-1, 1)
-            dsd_signed = 2 * dsd_channel - 1
+            dsd_signed = (2 * dsd_channel.astype(np.int8) - 1).astype(np.float64)
+            
             # Apply low-pass filter
-            filtered_data = lfilter(self.b, self.a, dsd_signed)
+            filtered_data = sosfiltfilt(self.sos, dsd_signed, axis=0)
             
             # Decimate (downsample)
             # 分母と分子を用いた整数比を計算
@@ -84,15 +91,19 @@ class DSDProcessor:
             pcm_data.append(pcm_channel)
         return np.array(pcm_data).T  # Soundfileの形式に対応させるために転置する
 
-    def dsd_to_pcm_stream(self, output_file, pcm_sample_rate, cutoff_freq, buffer_size=1024*1024):
+    def dsd_to_pcm_stream(self, output_file, pcm_sample_rate, cutoff_freq, stopband_atten, buffer_size=8192*1024):
         
         with open(self.file, "rb") as dsf:
             # Parse the DSF header
             self._read_dsf_header(dsf)
             
             # make a low-pass filter
-            nyquist_rate = self.dsd_sample_rate / 2
-            self.b, self.a = butter(5, cutoff_freq / nyquist_rate, btype='low')
+            wp1 = cutoff_freq           # 通過域遮断周波数[Hz]
+            ws1 = cutoff_freq * 1.05    # 阻止域遮断周波数[Hz]
+            gpass1 = 0.5                # 通過域最大損失量[dB]
+            gstop1 = stopband_atten     # 阻止域最小減衰量[dB]
+            
+            self.sos = iirdesign(wp1, ws1, gpass1, gstop1, output='sos', ftype='cheby2', fs=self.dsd_sample_rate)
             
             # Move the file pointer to the start of the data section
             dsf.seek(self.data_start)
@@ -185,7 +196,7 @@ class AudioProcessor:
             pcm_temp_path = output_path.replace(".flac", "_temp.wav")
             dsd_processor = DSDProcessor(self.filepath) 
             
-            if not dsd_processor.dsd_to_pcm_stream(pcm_temp_path, target_samplerate, cutoff):
+            if not dsd_processor.dsd_to_pcm_stream(pcm_temp_path, target_samplerate, cutoff, stopband_atten):
                 QMessageBox.critical(self, "Error", "Failed to convert DSD to PCM.")
                 return
             
