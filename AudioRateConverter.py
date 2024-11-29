@@ -11,23 +11,16 @@ from mutagen.flac import FLAC
 from mutagen.dsf import DSF
 import os
 import struct
+from concurrent.futures import ThreadPoolExecutor
 
 SIZE_CHUNK = 10
+SIZE_DSD_CHUNK = 1024
 
 class DSDProcessor:
     def __init__(self, file):
         self.file = file
         
     def _read_dsf_header(self, file):
-        """
-        Reads the DSF header and returns metadata, and ensures file pointer is at the start of the DSD data section.
-
-        Parameters:
-            file (file object): Opened DSF file in binary mode.
-
-        Returns:
-            dict: A dictionary containing metadata.
-        """
         # Read the DSF header
         header = file.read(28)
         if header[:4] != b"DSD ":  # Check DSF magic number
@@ -49,9 +42,11 @@ class DSDProcessor:
         self.channel_count = struct.unpack("<I", file.read(4))[0]
         self.dsd_sample_rate = struct.unpack("<I", file.read(4))[0]
         self.dsd_bit_depth = struct.unpack("<I", file.read(4))[0]
-
+        file.seek(8, 1)
+        self.block_size_per_ch = struct.unpack("<I", file.read(4))[0]
+        
         # Skip to the beginning of the data chunk
-        file.seek(16, 1)
+        file.seek(4, 1)
 
         # Read the data chunk header
         data_chunk_header = file.read(12)
@@ -63,23 +58,40 @@ class DSDProcessor:
         self.data_start = file.tell()  # Store the starting position of the data section
 
 
-    def _dsd_chunk_to_pcm(self, dsd_chunk, pcm_sample_rate):
-        
-        # Unpack 8-bit packed DSD data to 1-bit
-        dsd_unpacked = np.unpackbits(dsd_chunk).reshape(-1, self.channel_count * 8)
+    def _process_dsf_chunk(self, dsf_file):
+        # Total chunk size is 4096 bytes per channel
+        total_chunk_size = self.block_size_per_ch * self.channel_count
+        packed_chunk = dsf_file.read(total_chunk_size)
+
+        if not packed_chunk or len(packed_chunk) < total_chunk_size:
+            return None  # End of file or incomplete chunk
+
+        # Split packed data into per-channel arrays
+        packed_channels = [
+            packed_chunk[i * self.block_size_per_ch:(i + 1) * self.block_size_per_ch]
+            for i in range(self.channel_count)
+        ]
+
+        # Unpack bits for each channel and store in a list
+        unpacked_channels = [
+            np.unpackbits(np.frombuffer(ch_data, dtype=np.uint8))
+            for ch_data in packed_channels
+        ]
+        # Stack all channels together
+        return np.stack(unpacked_channels)
+
+
+    def _process_chunk(self, chunk_data, pcm_sample_rate):
         
         # Convert a chunk of DSD data to PCM
         pcm_data = []
         for ch in range(self.channel_count):
-            # Extract interleaved channel data
-            dsd_channel = dsd_unpacked[:, ch::self.channel_count]
-            dsd_channel = dsd_channel.flatten()  # Flatten interleaved bits into a single array
-            
             # Convert 1-bit DSD to signed (-1, 1)
-            dsd_signed = (2 * dsd_channel.astype(np.int8) - 1).astype(np.float64)
+            dsd_signed = (2 * chunk_data[ch].astype(np.int8) - 1).astype(np.float64)
             
             # Apply low-pass filter
             filtered_data = sosfiltfilt(self.sos, dsd_signed, axis=0)
+            #filtered_data = lfilter(self.b, self.a, dsd_signed)
             
             # Decimate (downsample)
             # 分母と分子を用いた整数比を計算
@@ -88,22 +100,27 @@ class DSDProcessor:
             down = int(self.dsd_sample_rate // gcd)  # 分母
 
             pcm_channel = resample_poly(filtered_data, up, down)
+            #decimation_factor = self.dsd_sample_rate // pcm_sample_rate
+            #pcm_channel = filtered_data[::decimation_factor]
             pcm_data.append(pcm_channel)
-        return np.array(pcm_data).T  # Soundfileの形式に対応させるために転置する
+        return np.stack(pcm_data, axis=1)  # Interleaved PCM data
 
-    def dsd_to_pcm_stream(self, output_file, pcm_sample_rate, cutoff_freq, stopband_atten, buffer_size=8192*1024):
+    def dsd_to_pcm_stream(self, output_file, pcm_sample_rate, cutoff_freq, stopband_atten):
         
         with open(self.file, "rb") as dsf:
             # Parse the DSF header
             self._read_dsf_header(dsf)
             
             # make a low-pass filter
-            wp1 = cutoff_freq           # 通過域遮断周波数[Hz]
-            ws1 = cutoff_freq * 1.05    # 阻止域遮断周波数[Hz]
-            gpass1 = 0.5                # 通過域最大損失量[dB]
-            gstop1 = stopband_atten     # 阻止域最小減衰量[dB]
+            wp1 = cutoff_freq               # 通過域遮断周波数[Hz]
+            ws1 = pcm_sample_rate / 0.5     # 阻止域遮断周波数[Hz]
+            gpass1 = 0.5                    # 通過域最大損失量[dB]
+            gstop1 = stopband_atten         # 阻止域最小減衰量[dB]
             
             self.sos = iirdesign(wp1, ws1, gpass1, gstop1, output='sos', ftype='cheby2', fs=self.dsd_sample_rate)
+            
+            #nyquist_rate = self.dsd_sample_rate / 2
+            #self.b, self.a = butter(5, cutoff_freq / nyquist_rate, btype='low')
             
             # Move the file pointer to the start of the data section
             dsf.seek(self.data_start)
@@ -114,21 +131,24 @@ class DSDProcessor:
                                 subtype='PCM_24',
                                 format='WAV') as wav:
                 
-                # Process DSD data in chunks
-                remaining_size = self.data_size
-                while remaining_size > 0:
-                    chunk_size = min(buffer_size, remaining_size)
-                    chunk = dsf.read(chunk_size)
-                    if not chunk:
-                        break
+                # Thread pool for concurrent processing
+                with ThreadPoolExecutor() as executor:
+                    futures = []
+                    while True:
+                        # Read the next chunk
+                        chunk = self._process_dsf_chunk(dsf)
+                        if chunk is None:  # End of file
+                            break
 
-                    # Convert DSD chunk to PCM
-                    dsd_data = np.frombuffer(chunk, dtype=np.uint8)
-                    pcm_data = self._dsd_chunk_to_pcm(dsd_data, pcm_sample_rate)
-
-                    # Write PCM data to WAV
-                    wav.write(pcm_data)
-                    remaining_size -= chunk_size
+                        # Submit the chunk for processing
+                        future = executor.submit(
+                            self._process_chunk, chunk, pcm_sample_rate
+                        )
+                        futures.append(future)
+                    # Write processed PCM data to the WAV file as chunks complete
+                    for future in futures:
+                        pcm_output = future.result()
+                        wav.write(pcm_output)
         return 1
 
 
@@ -275,7 +295,7 @@ class MainWindow(QWidget):
         self.filter_cutoff_label = QLabel("Filter Cutoff Frequency (Hz):")
         self.layout_0.addWidget(self.filter_cutoff_label)
 
-        self.filter_cutoff_input = QLineEdit("22000")
+        self.filter_cutoff_input = QLineEdit("21000")
         self.layout_0.addWidget(self.filter_cutoff_input)
 
         self.filter_stopband_label = QLabel("Filter stop band attenuation (dB):")
