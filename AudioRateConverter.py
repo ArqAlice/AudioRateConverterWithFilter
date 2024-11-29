@@ -11,10 +11,13 @@ from mutagen.flac import FLAC
 from mutagen.dsf import DSF
 import os
 import struct
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
+import threading
 
-SIZE_CHUNK = 10
-SIZE_DSD_CHUNK = 1024
+SIZE_PCM_CHUNK = 10
+SIZE_DSD_CHUNK = 8
+BYTE_TO_BIT = 8
+THREADS = 16
 
 class DSDProcessor:
     def __init__(self, file):
@@ -58,13 +61,15 @@ class DSDProcessor:
         self.data_start = file.tell()  # Store the starting position of the data section
 
 
-    def _process_dsf_chunk(self, dsf_file):
+    def _process_dsf_chunk(self, dsf_file, offset, lock):
+        
         # Total chunk size is 4096 bytes per channel
         total_chunk_size = self.block_size_per_ch * self.channel_count
-        packed_chunk = dsf_file.read(total_chunk_size)
-
-        if not packed_chunk or len(packed_chunk) < total_chunk_size:
-            return None  # End of file or incomplete chunk
+        with lock:
+            dsf_file.seek(offset)
+            packed_chunk = dsf_file.read(total_chunk_size)
+            if not packed_chunk or len(packed_chunk) < total_chunk_size:
+                return None  # End of file or incomplete chunk
 
         # Split packed data into per-channel arrays
         packed_channels = [
@@ -81,17 +86,25 @@ class DSDProcessor:
         return np.stack(unpacked_channels)
 
 
-    def _process_chunk(self, chunk_data, pcm_sample_rate):
+    def _filter_process_chunk(self, buffer, chunk_data, pcm_sample_rate):
+        
+        if chunk_data.size == 0:
+            return [], []
+        
+        # Combine buffer and new chunk
+        combined_chunk = np.concatenate((buffer, chunk_data), axis=1)
         
         # Convert a chunk of DSD data to PCM
         pcm_data = []
         for ch in range(self.channel_count):
             # Convert 1-bit DSD to signed (-1, 1)
-            dsd_signed = (2 * chunk_data[ch].astype(np.int8) - 1).astype(np.float64)
+            dsd_signed = (2 * combined_chunk[ch].astype(np.int8) - 1).astype(np.float64)
             
             # Apply low-pass filter
-            filtered_data = sosfiltfilt(self.sos, dsd_signed, axis=0)
-            #filtered_data = lfilter(self.b, self.a, dsd_signed)
+            filtered_data = sosfiltfilt(self.sos, dsd_signed, axis=-1)
+            
+            # exclude overlap buffer
+            filtered_data = filtered_data[buffer.shape[1]:]
             
             # Decimate (downsample)
             # 分母と分子を用いた整数比を計算
@@ -102,10 +115,39 @@ class DSDProcessor:
             pcm_channel = resample_poly(filtered_data, up, down)
             #decimation_factor = self.dsd_sample_rate // pcm_sample_rate
             #pcm_channel = filtered_data[::decimation_factor]
-            pcm_data.append(pcm_channel)
-        return np.stack(pcm_data, axis=1)  # Interleaved PCM data
+            pcm_data.append(pcm_channel) # Interleaved PCM data
+        
+        # Update buffer with the last portion of the current chunk
+        overlap_size = buffer.shape[1]
+        updated_buffer = combined_chunk[:, -overlap_size:]
+        
+        return np.stack(pcm_data, axis=1), updated_buffer  
+    
+    def _dsd_to_pcm_core(self, dsf, in_buffer, offset_bytes, target_chunks, pcm_sample_rate, lock):
+        remain_chunks = target_chunks
+        offset = offset_bytes
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            while remain_chunks > 0:
+                to_read_chunks = min(target_chunks, remain_chunks)
+                for i in range(to_read_chunks):
+                    future = executor.submit(self._process_dsf_chunk, dsf, offset, lock)
+                    futures.append(future)
+                    offset += self.channel_count * self.block_size_per_ch
+                
+                # Process results as they are completed
+                out_buffer = np.empty((self.channel_count, 0))
+                for future in futures:
+                    chunk = future.result()
+                    if chunk is None:
+                        continue
+                    out_buffer = np.concatenate([out_buffer, chunk], 1)
+                remain_chunks -= to_read_chunks
+            return self._filter_process_chunk(in_buffer, out_buffer, pcm_sample_rate)
 
     def dsd_to_pcm_stream(self, output_file, pcm_sample_rate, cutoff_freq, stopband_atten):
+        
+        lock = threading.Lock()  # Lock for thread-safe file access
         
         with open(self.file, "rb") as dsf:
             # Parse the DSF header
@@ -124,7 +166,10 @@ class DSDProcessor:
             
             # Move the file pointer to the start of the data section
             dsf.seek(self.data_start)
-
+            
+            # Initialize input buffer for overlap filtering
+            in_buffer = np.zeros((self.channel_count, self.block_size_per_ch * BYTE_TO_BIT), dtype=np.uint8)
+            
             with sf.SoundFile(output_file, mode='w',
                                 samplerate=pcm_sample_rate,
                                 channels=self.channel_count,
@@ -132,28 +177,32 @@ class DSDProcessor:
                                 format='WAV') as wav:
                 
                 # Thread pool for concurrent processing
+                total_chunks = self.data_size // (self.channel_count * self.block_size_per_ch)
+                chunk_to_bytes = self.channel_count * self.block_size_per_ch
                 with ThreadPoolExecutor() as executor:
-                    futures = []
-                    while True:
-                        # Read the next chunk
-                        chunk = self._process_dsf_chunk(dsf)
-                        if chunk is None:  # End of file
-                            break
+                    remain_chunks = total_chunks
+                    offset = self.data_start
+                    while remain_chunks > 0:
+                        futures = []
+                        read_chunks = 0
+                        for i in range (THREADS):
+                            to_read_chunks = min(SIZE_DSD_CHUNK, remain_chunks)
+                            future = executor.submit(self._dsd_to_pcm_core, dsf, in_buffer, offset, to_read_chunks, pcm_sample_rate, lock)
+                            futures.append(future)
+                            offset += to_read_chunks * chunk_to_bytes
+                            read_chunks += to_read_chunks
 
-                        # Submit the chunk for processing
-                        future = executor.submit(
-                            self._process_chunk, chunk, pcm_sample_rate
-                        )
-                        futures.append(future)
-                    # Write processed PCM data to the WAV file as chunks complete
-                    for future in futures:
-                        pcm_output = future.result()
-                        wav.write(pcm_output)
+                        for future in futures:
+                            pcm_output, in_buffer = future.result()
+                            if len(pcm_output) == 0:
+                                break
+                            wav.write(pcm_output)
+                        remain_chunks -= read_chunks
         return 1
 
 
 class AudioProcessor:
-    def __init__(self, filepath, chunk_size=44100*SIZE_CHUNK):
+    def __init__(self, filepath, chunk_size=44100*SIZE_PCM_CHUNK):
         self.filepath = filepath
         self.samplerate = None
         self.chunk_size = chunk_size
@@ -360,7 +409,7 @@ class MainWindow(QWidget):
                 
                 bitdepth = int(self.bitdepth_input.currentText())
                 stopband_atten = float(self.filter_stopband_atten.text())
-                processor = AudioProcessor(file_path, resample_rate * SIZE_CHUNK)
+                processor = AudioProcessor(file_path, resample_rate * SIZE_PCM_CHUNK)
                 processor.process_in_chunks(output_path, cutoff, stopband_atten=stopband_atten, target_samplerate=resample_rate, target_bitdepth=bitdepth)
 
                 self.status_label.setText(f"Processed: {file_path}")
