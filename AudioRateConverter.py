@@ -63,12 +63,12 @@ class DSDProcessor:
 
     def _process_dsf_chunk(self, dsf_file, offset, lock):
         
-        # Total chunk size is 4096 bytes per channel
+        # Acquire chunk data from dsf file
         total_chunk_size = self.block_size_per_ch * self.channel_count
         with lock:
             dsf_file.seek(offset)
-            packed_chunk = dsf_file.read(total_chunk_size)
-            if not packed_chunk or len(packed_chunk) < total_chunk_size:
+            packed_chunk = np.frombuffer(dsf_file.read(total_chunk_size), dtype=np.uint8)
+            if not packed_chunk.any or packed_chunk.size < total_chunk_size:
                 return None  # End of file or incomplete chunk
 
         # Split packed data into per-channel arrays
@@ -76,12 +76,13 @@ class DSDProcessor:
             packed_chunk[i * self.block_size_per_ch:(i + 1) * self.block_size_per_ch]
             for i in range(self.channel_count)
         ]
-
+        
         # Unpack bits for each channel and store in a list
-        unpacked_channels = [
-            np.unpackbits(np.frombuffer(ch_data, dtype=np.uint8))
-            for ch_data in packed_channels
-        ]
+        unpacked_channels = np.empty((self.channel_count, self.block_size_per_ch * 8))
+        for ch in range(self.channel_count):
+            unpacked_1chnnel = np.unpackbits(packed_channels[ch]).reshape(-1, 8)
+            unpacked_channels[ch] = (np.fliplr(unpacked_1chnnel)).flatten()
+        
         # Stack all channels together
         return np.stack(unpacked_channels)
 
@@ -101,7 +102,7 @@ class DSDProcessor:
             dsd_signed = (2 * combined_chunk[ch].astype(np.int8) - 1).astype(np.float64)
             
             # Apply low-pass filter
-            filtered_data = sosfiltfilt(self.sos, dsd_signed, axis=-1)
+            filtered_data = sosfiltfilt(self.sos, dsd_signed, axis=0)
             
             # exclude overlap buffer
             filtered_data = filtered_data[buffer.shape[1]:]
@@ -168,7 +169,7 @@ class DSDProcessor:
             dsf.seek(self.data_start)
             
             # Initialize input buffer for overlap filtering
-            in_buffer = np.zeros((self.channel_count, self.block_size_per_ch * BYTE_TO_BIT), dtype=np.uint8)
+            in_buffer = np.zeros((self.channel_count, self.block_size_per_ch * BYTE_TO_BIT * SIZE_DSD_CHUNK), dtype=np.uint8)
             
             with sf.SoundFile(output_file, mode='w',
                                 samplerate=pcm_sample_rate,
