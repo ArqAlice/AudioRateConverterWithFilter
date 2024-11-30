@@ -15,9 +15,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 import threading
 
 SIZE_PCM_CHUNK = 10
-SIZE_DSD_CHUNK = 8
+SIZE_DSD_CHUNK = 256
 BYTE_TO_BIT = 8
-THREADS = 16
+THREADS = 1
 
 class DSDProcessor:
     def __init__(self, file):
@@ -128,8 +128,8 @@ class DSDProcessor:
         remain_chunks = target_chunks
         offset = offset_bytes
         with ThreadPoolExecutor() as executor:
-            futures = []
             while remain_chunks > 0:
+                futures = []
                 to_read_chunks = min(target_chunks, remain_chunks)
                 for i in range(to_read_chunks):
                     future = executor.submit(self._process_dsf_chunk, dsf, offset, lock)
@@ -169,7 +169,7 @@ class DSDProcessor:
             dsf.seek(self.data_start)
             
             # Initialize input buffer for overlap filtering
-            in_buffer = np.zeros((self.channel_count, self.block_size_per_ch * BYTE_TO_BIT * SIZE_DSD_CHUNK), dtype=np.uint8)
+            in_buffer = np.zeros((self.channel_count, self.block_size_per_ch * BYTE_TO_BIT), dtype=np.uint8)
             
             with sf.SoundFile(output_file, mode='w',
                                 samplerate=pcm_sample_rate,
