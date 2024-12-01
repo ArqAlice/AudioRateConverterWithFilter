@@ -1,23 +1,25 @@
 import sys
-import soundfile as sf
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
+import threading
+import soundfile as sf
 from scipy.signal import iirdesign, sosfiltfilt, butter, lfilter
 from scipy.signal import resample_poly
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QLabel, QFileDialog,
     QLineEdit, QListWidget, QComboBox,  QMessageBox, QHBoxLayout
 )
-from mutagen.flac import FLAC
+from mutagen.flac import FLAC, Picture
 from mutagen.dsf import DSF
+from mutagen.id3 import ID3, APIC
+import base64
 import os
 import struct
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait
-import threading
 
 SIZE_PCM_CHUNK = 10
-SIZE_DSD_CHUNK = 256
+SIZE_DSD_CHUNK = 8
 BYTE_TO_BIT = 8
-THREADS = 1
+THREADS = 8 * 5
 
 class DSDProcessor:
     def __init__(self, file):
@@ -118,13 +120,9 @@ class DSDProcessor:
             #pcm_channel = filtered_data[::decimation_factor]
             pcm_data.append(pcm_channel) # Interleaved PCM data
         
-        # Update buffer with the last portion of the current chunk
-        overlap_size = buffer.shape[1]
-        updated_buffer = combined_chunk[:, -overlap_size:]
-        
-        return np.stack(pcm_data, axis=1), updated_buffer  
+        return np.stack(pcm_data, axis=1)  
     
-    def _dsd_to_pcm_core(self, dsf, in_buffer, offset_bytes, target_chunks, pcm_sample_rate, lock):
+    def _dsd_to_pcm_core(self, dsf, offset_bytes, target_chunks, pcm_sample_rate, lock):
         remain_chunks = target_chunks
         offset = offset_bytes
         with ThreadPoolExecutor() as executor:
@@ -138,6 +136,18 @@ class DSDProcessor:
                 
                 # Process results as they are completed
                 out_buffer = np.empty((self.channel_count, 0))
+                
+                # wait for acquiring chunks
+                wait(futures)
+                
+                # if first read, buffer is zeros
+                if offset_bytes == self.data_start:
+                    in_buffer = np.zeros((self.channel_count, self.block_size_per_ch * BYTE_TO_BIT), dtype=np.uint8)
+                # if not first read, buffer is first chunks
+                else:
+                    in_buffer = futures[0].result()
+                
+                # packing chunks to convert
                 for future in futures:
                     chunk = future.result()
                     if chunk is None:
@@ -168,9 +178,6 @@ class DSDProcessor:
             # Move the file pointer to the start of the data section
             dsf.seek(self.data_start)
             
-            # Initialize input buffer for overlap filtering
-            in_buffer = np.zeros((self.channel_count, self.block_size_per_ch * BYTE_TO_BIT), dtype=np.uint8)
-            
             with sf.SoundFile(output_file, mode='w',
                                 samplerate=pcm_sample_rate,
                                 channels=self.channel_count,
@@ -188,14 +195,14 @@ class DSDProcessor:
                         read_chunks = 0
                         for i in range (THREADS):
                             to_read_chunks = min(SIZE_DSD_CHUNK, remain_chunks)
-                            future = executor.submit(self._dsd_to_pcm_core, dsf, in_buffer, offset, to_read_chunks, pcm_sample_rate, lock)
+                            future = executor.submit(self._dsd_to_pcm_core, dsf, offset, to_read_chunks, pcm_sample_rate, lock)
                             futures.append(future)
                             offset += to_read_chunks * chunk_to_bytes
                             read_chunks += to_read_chunks
 
                         for future in futures:
-                            pcm_output, in_buffer = future.result()
-                            if len(pcm_output) == 0:
+                            pcm_output = future.result()
+                            if np.array(pcm_output).size == 0:
                                 break
                             wav.write(pcm_output)
                         remain_chunks -= read_chunks
@@ -210,8 +217,10 @@ class AudioProcessor:
         
         if self.filepath.endswith(".dsf"):
             self.metadata = DSF(filepath)
+            self.filetype = "DSF"
         else:
             self.metadata = FLAC(filepath)
+            self.filetype = "FLAC"
 
     def process_in_chunks(self, output_path, cutoff, stopband_atten, filter_type='lowpass', 
                             target_samplerate=None, target_bitdepth=None):
@@ -303,11 +312,42 @@ class AudioProcessor:
             return np.column_stack(resampled)
 
     def _save_metadata(self, output_path):
-        new_metadata = FLAC(output_path)
-        for key, value in self.metadata.tags.items():
-            new_metadata[key] = value
-        new_metadata.save()
-
+        if self.filetype == "FLAC":
+            new_metadata = FLAC(output_path)
+            for key, value in self.metadata.tags.items():
+                new_metadata[key] = value
+            new_metadata.save()
+            
+        elif self.filetype == "DSF":
+            new_metadata = FLAC(output_path)
+            if 'TIT2' in self.metadata.tags:  # タイトル
+                new_metadata["TITLE"] = self.metadata.tags['TIT2'].text[0]
+            if 'TPE1' in self.metadata.tags:  # アーティスト
+                new_metadata["ARTIST"] = self.metadata.tags['TPE1'].text[0]
+            if 'TPE2' in self.metadata.tags:  # アーティスト
+                new_metadata["ALBUMARTIST"] = self.metadata.tags['TPE2'].text[0]
+            if 'TALB' in self.metadata.tags:  # アルバム
+                new_metadata["ALBUM"] = self.metadata.tags['TALB'].text[0]
+            if 'TRCK' in self.metadata.tags:  # トラック番号
+                new_metadata["TRACKNUMBER"] = self.metadata.tags['TRCK'].text[0]
+            if 'TPOS' in self.metadata.tags:  #ディスクNo
+                new_metadata["DISCNUMBER"] = self.metadata.tags['TPOS'].text[0]
+            if 'TCON' in self.metadata.tags:  # ジャンル
+                new_metadata["GENRE"] = self.metadata.tags['TCON'].text[0]
+            if 'COMM' in self.metadata.tags:  # コメント
+                new_metadata["COMMENT"] = self.metadata.tags['COMM'].text[0]
+            if 'TPUB' in self.metadata.tags:  # 版元
+                new_metadata["PUBLISHER"] = self.metadata.tags['TPUB'].text[0]
+            
+            if APIC in self.metadata.tags:
+                apic = self.metadata.tags['APIC']
+                image = Picture()
+                image.type = 3  # フロントカバー
+                image.mime = apic.mime
+                image.desc = apic.desc
+                image.data = apic.data
+                new_metadata.add_picture(image)
+            new_metadata.save()
 
 class MainWindow(QWidget):
     def __init__(self):
