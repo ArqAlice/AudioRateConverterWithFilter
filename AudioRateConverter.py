@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QLabel, QFileDialog,
     QLineEdit, QListWidget, QComboBox,  QMessageBox, QHBoxLayout
 )
+import mutagen.id3
 from mutagen.flac import FLAC, Picture
 from mutagen.dsf import DSF
 from mutagen.id3 import ID3, APIC
@@ -329,7 +330,7 @@ class AudioProcessor:
             if 'TALB' in self.metadata.tags:  # アルバム
                 new_metadata["ALBUM"] = self.metadata.tags['TALB'].text[0]
             if 'TRCK' in self.metadata.tags:  # トラック番号
-                new_metadata["TRACKNUMBER"] = self.metadata.tags['TRCK'].text[0]
+                new_metadata["TRACKNUMBER"] = mutagen.id3.NumericPartTextFrame(self.metadata.tags['TRCK'].text[0])
             if 'TPOS' in self.metadata.tags:  #ディスクNo
                 new_metadata["DISCNUMBER"] = self.metadata.tags['TPOS'].text[0]
             if 'TCON' in self.metadata.tags:  # ジャンル
