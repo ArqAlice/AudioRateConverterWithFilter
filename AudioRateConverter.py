@@ -1,4 +1,5 @@
 import sys
+from DsdProcessor import dsd_to_pcm_stream
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 import threading
@@ -13,202 +14,11 @@ import mutagen.id3
 from mutagen.flac import FLAC, Picture
 from mutagen.dsf import DSF
 from mutagen.id3 import ID3, APIC
-import base64
 import os
-import struct
 
 SIZE_PCM_CHUNK = 10
-SIZE_DSD_CHUNK = 8
 BYTE_TO_BIT = 8
-THREADS = 8 * 5
-
-class DSDProcessor:
-    def __init__(self, file):
-        self.file = file
-        
-    def _read_dsf_header(self, file):
-        # Read the DSF header
-        header = file.read(28)
-        if header[:4] != b"DSD ":  # Check DSF magic number
-            raise ValueError("Invalid DSF file")
-
-        # Extract file size and format chunk size
-        file_size = struct.unpack("<Q", header[12:20])[0]
-        
-        # Skip fmt chunk header
-        file.seek(4, 1)
-        
-        fmt_chunk_size = struct.unpack("<Q", file.read(8))[0]
-
-        # Skip reserved bytes in format chunk
-        file.seek(8, 1)
-
-        # Extract format details
-        channel_type = struct.unpack("<I", file.read(4))[0]
-        self.channel_count = struct.unpack("<I", file.read(4))[0]
-        self.dsd_sample_rate = struct.unpack("<I", file.read(4))[0]
-        self.dsd_bit_depth = struct.unpack("<I", file.read(4))[0]
-        file.seek(8, 1)
-        self.block_size_per_ch = struct.unpack("<I", file.read(4))[0]
-        
-        # Skip to the beginning of the data chunk
-        file.seek(4, 1)
-
-        # Read the data chunk header
-        data_chunk_header = file.read(12)
-        if data_chunk_header[:4] != b"data":  # Check "data" chunk magic number
-            raise ValueError("Invalid DSF data chunk")
-
-        # Extract the size of the DSD data
-        self.data_size = struct.unpack("<Q", data_chunk_header[4:12])[0]
-        self.data_start = file.tell()  # Store the starting position of the data section
-
-
-    def _process_dsf_chunk(self, dsf_file, offset, lock):
-        
-        # Acquire chunk data from dsf file
-        total_chunk_size = self.block_size_per_ch * self.channel_count
-        with lock:
-            dsf_file.seek(offset)
-            packed_chunk = np.frombuffer(dsf_file.read(total_chunk_size), dtype=np.uint8)
-            if not packed_chunk.any or packed_chunk.size < total_chunk_size:
-                return None  # End of file or incomplete chunk
-
-        # Split packed data into per-channel arrays
-        packed_channels = [
-            packed_chunk[i * self.block_size_per_ch:(i + 1) * self.block_size_per_ch]
-            for i in range(self.channel_count)
-        ]
-        
-        # Unpack bits for each channel and store in a list
-        unpacked_channels = np.empty((self.channel_count, self.block_size_per_ch * 8))
-        for ch in range(self.channel_count):
-            unpacked_1chnnel = np.unpackbits(packed_channels[ch]).reshape(-1, 8)
-            unpacked_channels[ch] = (np.fliplr(unpacked_1chnnel)).flatten()
-        
-        # Stack all channels together
-        return np.stack(unpacked_channels)
-
-
-    def _filter_process_chunk(self, buffer, chunk_data, pcm_sample_rate):
-        
-        if chunk_data.size == 0:
-            return [], []
-        
-        # Combine buffer and new chunk
-        combined_chunk = np.concatenate((buffer, chunk_data), axis=1)
-        
-        # Convert a chunk of DSD data to PCM
-        pcm_data = []
-        for ch in range(self.channel_count):
-            # Convert 1-bit DSD to signed (-1, 1)
-            dsd_signed = (2 * combined_chunk[ch].astype(np.int8) - 1).astype(np.float64)
-            
-            # Apply low-pass filter
-            filtered_data = sosfiltfilt(self.sos, dsd_signed, axis=0)
-            
-            # exclude overlap buffer
-            filtered_data = filtered_data[buffer.shape[1]:]
-            
-            # Decimate (downsample)
-            # 分母と分子を用いた整数比を計算
-            gcd = np.gcd(int(self.dsd_sample_rate), int(pcm_sample_rate))
-            up = int(pcm_sample_rate // gcd)  # 分子
-            down = int(self.dsd_sample_rate // gcd)  # 分母
-
-            pcm_channel = resample_poly(filtered_data, up, down)
-            #decimation_factor = self.dsd_sample_rate // pcm_sample_rate
-            #pcm_channel = filtered_data[::decimation_factor]
-            pcm_data.append(pcm_channel) # Interleaved PCM data
-        
-        return np.stack(pcm_data, axis=1)  
-    
-    def _dsd_to_pcm_core(self, dsf, offset_bytes, target_chunks, pcm_sample_rate, lock):
-        remain_chunks = target_chunks
-        offset = offset_bytes
-        with ThreadPoolExecutor() as executor:
-            while remain_chunks > 0:
-                futures = []
-                to_read_chunks = min(target_chunks, remain_chunks)
-                for i in range(to_read_chunks):
-                    future = executor.submit(self._process_dsf_chunk, dsf, offset, lock)
-                    futures.append(future)
-                    offset += self.channel_count * self.block_size_per_ch
-                
-                # Process results as they are completed
-                out_buffer = np.empty((self.channel_count, 0))
-                
-                # wait for acquiring chunks
-                wait(futures)
-                
-                # if first read, buffer is zeros
-                if offset_bytes == self.data_start:
-                    in_buffer = np.zeros((self.channel_count, self.block_size_per_ch * BYTE_TO_BIT), dtype=np.uint8)
-                # if not first read, buffer is first chunks
-                else:
-                    in_buffer = futures[0].result()
-                
-                # packing chunks to convert
-                for future in futures:
-                    chunk = future.result()
-                    if chunk is None:
-                        continue
-                    out_buffer = np.concatenate([out_buffer, chunk], 1)
-                remain_chunks -= to_read_chunks
-            return self._filter_process_chunk(in_buffer, out_buffer, pcm_sample_rate)
-
-    def dsd_to_pcm_stream(self, output_file, pcm_sample_rate, cutoff_freq, stopband_atten):
-        
-        lock = threading.Lock()  # Lock for thread-safe file access
-        
-        with open(self.file, "rb") as dsf:
-            # Parse the DSF header
-            self._read_dsf_header(dsf)
-            
-            # make a low-pass filter
-            wp1 = cutoff_freq               # 通過域遮断周波数[Hz]
-            ws1 = pcm_sample_rate / 0.5     # 阻止域遮断周波数[Hz]
-            gpass1 = 0.5                    # 通過域最大損失量[dB]
-            gstop1 = stopband_atten         # 阻止域最小減衰量[dB]
-            
-            self.sos = iirdesign(wp1, ws1, gpass1, gstop1, output='sos', ftype='cheby2', fs=self.dsd_sample_rate)
-            
-            #nyquist_rate = self.dsd_sample_rate / 2
-            #self.b, self.a = butter(5, cutoff_freq / nyquist_rate, btype='low')
-            
-            # Move the file pointer to the start of the data section
-            dsf.seek(self.data_start)
-            
-            with sf.SoundFile(output_file, mode='w',
-                                samplerate=pcm_sample_rate,
-                                channels=self.channel_count,
-                                subtype='PCM_24',
-                                format='WAV') as wav:
-                
-                # Thread pool for concurrent processing
-                total_chunks = self.data_size // (self.channel_count * self.block_size_per_ch)
-                chunk_to_bytes = self.channel_count * self.block_size_per_ch
-                with ThreadPoolExecutor() as executor:
-                    remain_chunks = total_chunks
-                    offset = self.data_start
-                    while remain_chunks > 0:
-                        futures = []
-                        read_chunks = 0
-                        for i in range (THREADS):
-                            to_read_chunks = min(SIZE_DSD_CHUNK, remain_chunks)
-                            future = executor.submit(self._dsd_to_pcm_core, dsf, offset, to_read_chunks, pcm_sample_rate, lock)
-                            futures.append(future)
-                            offset += to_read_chunks * chunk_to_bytes
-                            read_chunks += to_read_chunks
-
-                        for future in futures:
-                            pcm_output = future.result()
-                            if np.array(pcm_output).size == 0:
-                                break
-                            wav.write(pcm_output)
-                        remain_chunks -= read_chunks
-        return 1
-
+THREADS = 24
 
 class AudioProcessor:
     def __init__(self, filepath, chunk_size=44100*SIZE_PCM_CHUNK):
@@ -274,9 +84,8 @@ class AudioProcessor:
         # ファイルタイプがFLACでないとき(DSFのとき)
         else:
             pcm_temp_path = output_path.replace(".flac", "_temp.wav")
-            dsd_processor = DSDProcessor(self.filepath) 
             
-            if not dsd_processor.dsd_to_pcm_stream(pcm_temp_path, target_samplerate, cutoff, stopband_atten):
+            if not dsd_to_pcm_stream(self.filepath, pcm_temp_path, THREADS, target_samplerate, cutoff, stopband_atten):
                 QMessageBox.critical(self, "Error", "Failed to convert DSD to PCM.")
                 return
             
@@ -330,7 +139,10 @@ class AudioProcessor:
             if 'TALB' in self.metadata.tags:  # アルバム
                 new_metadata["ALBUM"] = self.metadata.tags['TALB'].text[0]
             if 'TRCK' in self.metadata.tags:  # トラック番号
-                new_metadata["TRACKNUMBER"] = mutagen.id3.NumericPartTextFrame(self.metadata.tags['TRCK'].text[0])
+                track_No = self.metadata.tags['TRCK'].text[0]
+                part = track_No.partition('/')
+                new_metadata["TRACKNUMBER"] = part[0]
+                new_metadata["TOTALTRACKS"] = part[2]
             if 'TPOS' in self.metadata.tags:  #ディスクNo
                 new_metadata["DISCNUMBER"] = self.metadata.tags['TPOS'].text[0]
             if 'TCON' in self.metadata.tags:  # ジャンル
