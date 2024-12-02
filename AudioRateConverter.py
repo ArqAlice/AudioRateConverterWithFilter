@@ -130,30 +130,33 @@ class AudioProcessor:
             
         elif self.filetype == "DSF":
             new_metadata = FLAC(output_path)
-            if 'TIT2' in self.metadata.tags:  # タイトル
-                new_metadata["TITLE"] = self.metadata.tags['TIT2'].text[0]
-            if 'TPE1' in self.metadata.tags:  # アーティスト
-                new_metadata["ARTIST"] = self.metadata.tags['TPE1'].text[0]
-            if 'TPE2' in self.metadata.tags:  # アーティスト
-                new_metadata["ALBUMARTIST"] = self.metadata.tags['TPE2'].text[0]
-            if 'TALB' in self.metadata.tags:  # アルバム
-                new_metadata["ALBUM"] = self.metadata.tags['TALB'].text[0]
-            if 'TRCK' in self.metadata.tags:  # トラック番号
-                track_No = self.metadata.tags['TRCK'].text[0]
+            if "TIT2" in self.metadata.tags:  # タイトル
+                new_metadata["TITLE"] = self.metadata.tags["TIT2"].text[0]
+            if "TPE1" in self.metadata.tags:  # アーティスト
+                new_metadata["ARTIST"] = self.metadata.tags["TPE1"].text[0]
+            if "TPE2" in self.metadata.tags:  # アーティスト
+                new_metadata["ALBUMARTIST"] = self.metadata.tags["TPE2"].text[0]
+            if "TALB" in self.metadata.tags:  # アルバム
+                new_metadata["ALBUM"] = self.metadata.tags["TALB"].text[0]
+            if "TRCK" in self.metadata.tags:  # トラック番号
+                track_No = self.metadata.tags["TRCK"].text[0]
                 part = track_No.partition('/')
                 new_metadata["TRACKNUMBER"] = part[0]
                 new_metadata["TOTALTRACKS"] = part[2]
-            if 'TPOS' in self.metadata.tags:  #ディスクNo
-                new_metadata["DISCNUMBER"] = self.metadata.tags['TPOS'].text[0]
-            if 'TCON' in self.metadata.tags:  # ジャンル
-                new_metadata["GENRE"] = self.metadata.tags['TCON'].text[0]
-            if 'COMM' in self.metadata.tags:  # コメント
-                new_metadata["COMMENT"] = self.metadata.tags['COMM'].text[0]
-            if 'TPUB' in self.metadata.tags:  # 版元
-                new_metadata["PUBLISHER"] = self.metadata.tags['TPUB'].text[0]
+            if "TPOS" in self.metadata.tags:  #ディスクNo
+                disc_No = self.metadata.tags["TPOS"].text[0]
+                part = disc_No.partition('/')
+                new_metadata["DISCNUMBER"] = part[0]
+                new_metadata["TOTALDISCS"] = part[2]
+            if "TCON" in self.metadata.tags:  # ジャンル
+                new_metadata["GENRE"] = self.metadata.tags["TCON"].text[0]
+            if "COMM" in self.metadata.tags:  # コメント
+                new_metadata["COMMENT"] = self.metadata.tags["COMM"].text[0]
+            if "TPUB" in self.metadata.tags:  # 版元
+                new_metadata["PUBLISHER"] = self.metadata.tags["TPUB"].text[0]
             
-            if APIC in self.metadata.tags:
-                apic = self.metadata.tags['APIC']
+            if "APIC:" in self.metadata.tags:
+                apic = self.metadata.tags["APIC:"]
                 image = Picture()
                 image.type = 3  # フロントカバー
                 image.mime = apic.mime
