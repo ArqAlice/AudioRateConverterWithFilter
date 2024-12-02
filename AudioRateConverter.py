@@ -18,7 +18,7 @@ import os
 
 SIZE_PCM_CHUNK = 10
 BYTE_TO_BIT = 8
-THREADS = 24
+THREADS = 16
 
 class AudioProcessor:
     def __init__(self, filepath, chunk_size=44100*SIZE_PCM_CHUNK):
@@ -33,7 +33,7 @@ class AudioProcessor:
             self.metadata = FLAC(filepath)
             self.filetype = "FLAC"
 
-    def process_in_chunks(self, output_path, cutoff, stopband_atten, filter_type='lowpass', 
+    def process_in_chunks(self, output_path, cutoff, dsd_hpf_cutoff, stopband_atten, filter_type='lowpass', 
                             target_samplerate=None, target_bitdepth=None):
 
         # ファイルタイプがFLACのとき
@@ -85,7 +85,7 @@ class AudioProcessor:
         else:
             pcm_temp_path = output_path.replace(".flac", "_temp.wav")
             
-            if not dsd_to_pcm_stream(self.filepath, pcm_temp_path, THREADS, target_samplerate, cutoff, stopband_atten):
+            if not dsd_to_pcm_stream(self.filepath, pcm_temp_path, THREADS, target_samplerate, cutoff, stopband_atten, dsd_hpf_cutoff):
                 QMessageBox.critical(self, "Error", "Failed to convert DSD to PCM.")
                 return
             
@@ -210,6 +210,12 @@ class MainWindow(QWidget):
         self.filter_stopband_atten = QLineEdit("150")
         self.layout_0.addWidget(self.filter_stopband_atten)
 
+        self.hpf_cutoff_label = QLabel("HPF Cutoff Frequency (Hz): (DSD only)")
+        self.layout_0.addWidget(self.hpf_cutoff_label)
+
+        self.hpf_cutoff_input = QLineEdit("10")
+        self.layout_0.addWidget(self.hpf_cutoff_input)
+
         self.resample_rate_label = QLabel("Resample Rate (Hz):")
         self.layout_0.addWidget(self.resample_rate_label)
 
@@ -251,6 +257,7 @@ class MainWindow(QWidget):
     def process_files(self):
         try:
             cutoff = float(self.filter_cutoff_input.text())
+            dsd_hpf_cutoff = float(self.hpf_cutoff_input.text())
             resample_rate = int(self.resample_rate_input.currentText())
 
             for i in range(self.file_list_widget.count()):
@@ -267,7 +274,8 @@ class MainWindow(QWidget):
                 bitdepth = int(self.bitdepth_input.currentText())
                 stopband_atten = float(self.filter_stopband_atten.text())
                 processor = AudioProcessor(file_path, resample_rate * SIZE_PCM_CHUNK)
-                processor.process_in_chunks(output_path, cutoff, stopband_atten=stopband_atten, target_samplerate=resample_rate, target_bitdepth=bitdepth)
+                processor.process_in_chunks(output_path, cutoff, dsd_hpf_cutoff, stopband_atten=stopband_atten,
+                                            target_samplerate=resample_rate, target_bitdepth=bitdepth)
 
                 self.status_label.setText(f"Processed: {file_path}")
 
