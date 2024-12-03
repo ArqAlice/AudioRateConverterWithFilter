@@ -52,7 +52,7 @@ def _read_dsf_header(file):
     audio_attr["data_start"] = data_start
     audio_attr["dsd_sample_rate"] = dsd_sample_rate
     audio_attr["dsd_bit_depth"] = dsd_bit_depth
-    audio_attr["data_size"] = sample_count * channel_count / 8
+    audio_attr["data_size"] = int(sample_count * channel_count / 8 * 0.98)
 
     return audio_attr
 
@@ -89,7 +89,7 @@ def _unpack_dsf_chunk(audio_attr, packed_chunk):
             unpacked_channels[ch] = unpacked_1chnnel.flatten()
     
     # Stack all channels together
-    return np.stack(unpacked_channels)
+    return unpacked_channels
 
 
 def _process_dsf_chunks(audio_attr, dsf, offset_bytes, target_chunks):
@@ -145,7 +145,7 @@ def _convert_to_pcm_raw(audio_attr, lpf_param, buffer, chunk_data, pcm_sample_ra
     pcm_data = []
     for ch in range(audio_attr["channel_count"]):
         # Convert 1-bit DSD to signed (-1, 1)
-        dsd_signed = (2 * combined_chunk[ch].astype(np.int8) - 1).astype(np.float64)
+        dsd_signed = (2 * combined_chunk[ch].astype(np.int8) - 1).astype(np.float64) * 2
         
         # Apply low-pass filter
         filtered_data = sosfiltfilt(lpf_param, dsd_signed, axis=0)
