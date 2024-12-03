@@ -1,13 +1,12 @@
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, wait
-import threading
 import soundfile as sf
 from scipy.signal import iirdesign, sosfiltfilt, butter, lfilter
 from scipy.signal import resample_poly
 import struct
 
-SIZE_DSD_CHUNK = 96
-FILTER_BUFFER_CHUNKS = 64
+SIZE_DSD_CHUNK = 256
+FILTER_BUFFER_CHUNKS = 128
 BYTE_TO_BIT = 8
 
 
@@ -57,17 +56,22 @@ def _read_dsf_header(file):
 
     return audio_attr
 
-def _acquire_dsf_chunk(audio_attr, file, offset, lock):
-    
+
+def _read_and_pack_dsf_chunk(audio_attr, file, offset):
     # Acquire chunk data from dsf file
     total_chunk_size = audio_attr["block_size_per_ch"] * audio_attr["channel_count"]
 
-    with lock:
-        file.seek(offset)
-        packed_chunk = np.frombuffer(file.read(total_chunk_size), dtype=np.uint8)
-        if not packed_chunk.any or packed_chunk.size < total_chunk_size:
-            return None  # End of file or incomplete chunk
+    file.seek(offset)
+    packed_chunk = np.frombuffer(file.read(total_chunk_size), dtype=np.uint8)
+    if not packed_chunk.any or packed_chunk.size < total_chunk_size:
+        return None  # End of file or incomplete chunk
+    return packed_chunk
 
+def _unpack_dsf_chunk(audio_attr, packed_chunk):
+    
+    if packed_chunk is None:
+        return None
+    
     # Split packed data into per-channel arrays
     packed_channels = [
         packed_chunk[i * audio_attr["block_size_per_ch"] : (i + 1) * audio_attr["block_size_per_ch"]]
@@ -88,7 +92,7 @@ def _acquire_dsf_chunk(audio_attr, file, offset, lock):
     return np.stack(unpacked_channels)
 
 
-def _process_dsf_chunks(audio_attr, dsf, offset_bytes, target_chunks, lock):
+def _process_dsf_chunks(audio_attr, dsf, offset_bytes, target_chunks):
     remain_chunks = target_chunks
     offset = offset_bytes
     with ThreadPoolExecutor() as executor:
@@ -96,7 +100,8 @@ def _process_dsf_chunks(audio_attr, dsf, offset_bytes, target_chunks, lock):
             futures = []
             to_read_chunks = min(target_chunks, remain_chunks)
             for i in range(to_read_chunks):
-                future = executor.submit(_acquire_dsf_chunk, audio_attr, dsf, offset, lock)
+                packed_chunk = _read_and_pack_dsf_chunk(audio_attr, dsf, offset)
+                future = executor.submit(_unpack_dsf_chunk, audio_attr, packed_chunk)
                 futures.append(future)
                 offset += audio_attr["channel_count"] * audio_attr["block_size_per_ch"]
             
@@ -128,10 +133,10 @@ def _process_dsf_chunks(audio_attr, dsf, offset_bytes, target_chunks, lock):
             remain_chunks -= to_read_chunks
         return out_buffer, in_buffer
 
-def _convert_to_pcm_raw(audio_attr, lpf_param, hpf_param, buffer, chunk_data, pcm_sample_rate):
+def _convert_to_pcm_raw(audio_attr, lpf_param, buffer, chunk_data, pcm_sample_rate):
     
-    if chunk_data.size == 0:
-        return [], []
+    if chunk_data is None:
+        return None
     
     # Combine buffer and new chunk
     combined_chunk = np.concatenate((buffer, chunk_data), axis=1)
@@ -144,9 +149,6 @@ def _convert_to_pcm_raw(audio_attr, lpf_param, hpf_param, buffer, chunk_data, pc
         
         # Apply low-pass filter
         filtered_data = sosfiltfilt(lpf_param, dsd_signed, axis=0)
-        
-        # Apply high-pass filter
-        filtered_data = sosfiltfilt(hpf_param, filtered_data, axis=0)
         
         # exclude overlap buffer
         filtered_data = filtered_data[buffer.shape[1]:]
@@ -164,10 +166,8 @@ def _convert_to_pcm_raw(audio_attr, lpf_param, hpf_param, buffer, chunk_data, pc
     
     return np.stack(pcm_data, axis=1)  
 
-def dsd_to_pcm_stream(dsf_file, output_file, threads ,pcm_sample_rate, cutoff_freq, stopband_atten, hpf_cutoff):
+def dsd_to_pcm_stream(dsf_file, output_file, threads ,pcm_sample_rate, cutoff_freq, stopband_atten):
     
-    lock = threading.Lock()
-
     with open(dsf_file, "rb") as dsf:
         # Parse the DSF header
         audio_attr = _read_dsf_header(dsf)
@@ -179,14 +179,6 @@ def dsd_to_pcm_stream(dsf_file, output_file, threads ,pcm_sample_rate, cutoff_fr
         gstop1 = stopband_atten         # 阻止域最小減衰量[dB]
         
         lpf = iirdesign(wp1, ws1, gpass1, gstop1, output='sos', ftype='cheby2', fs=audio_attr["dsd_sample_rate"])
-        
-        # make a high-pass filter
-        hpf_wp = hpf_cutoff * 1.2
-        hpf_ws1 = hpf_cutoff
-        gpass_hpf = 0.05
-        gstop_hpf = 50
-        
-        hpf = iirdesign(hpf_wp, hpf_ws1, gpass_hpf, gstop_hpf, output='sos', ftype='cheby2', fs=audio_attr["dsd_sample_rate"])
         
         #nyquist_rate = self.dsd_sample_rate / 2
         #self.b, self.a = butter(5, cutoff_freq / nyquist_rate, btype='low')
@@ -212,15 +204,15 @@ def dsd_to_pcm_stream(dsf_file, output_file, threads ,pcm_sample_rate, cutoff_fr
                     read_chunks = 0
                     for i in range (threads):
                         to_read_chunks = min(SIZE_DSD_CHUNK, remain_chunks)
-                        to_conv_chunks, buffer = _process_dsf_chunks(audio_attr, dsf, offset, to_read_chunks, lock)
-                        future = executor.submit(_convert_to_pcm_raw, audio_attr, lpf, hpf, buffer, to_conv_chunks, pcm_sample_rate)
+                        to_conv_chunks, buffer = _process_dsf_chunks(audio_attr, dsf, offset, to_read_chunks)
+                        future = executor.submit(_convert_to_pcm_raw, audio_attr, lpf, buffer, to_conv_chunks, pcm_sample_rate)
                         futures.append(future)
                         offset += to_read_chunks * chunk_to_bytes
                         read_chunks += to_read_chunks
 
                     for future in futures:
                         pcm_output = future.result()
-                        if np.array(pcm_output).size == 0:
+                        if pcm_output is None:
                             break
                         wav.write(pcm_output)
                     remain_chunks -= read_chunks
